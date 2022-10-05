@@ -1,6 +1,7 @@
 use eframe::egui;
 use feed_rs::model::Entry;
 use std::collections::HashMap;
+use klunky::*;
 mod rss;
 
 fn main() {
@@ -8,17 +9,20 @@ fn main() {
     let mut options = eframe::NativeOptions::default();
     options.resizable = true;
 
+    let mut reader: RssReader = Default::default();
+    reader.kc.spawn(100);
+
     // Run the eframe
     eframe::run_native(
         "RSS Reader",
         options,
-        Box::new(|_cc| Box::new(RssReader::default())),
+        Box::new(|_cc| Box::new(reader)),
     );
 }
 
 struct NameUrlPair {
-    name: &'static str,
-    url:  &'static str,
+    name: String,
+    url:  String,
 }
 
 // Our app's data
@@ -27,23 +31,25 @@ struct RssReader {
     feed_urls: Vec<NameUrlPair>,
 
     // Name of feed currently being viewed
-    current_feed_url: Option<&'static str>,
+    current_feed_url: Option<String>,
 
     // List of entries of currently viewed feed
-    feed_map: HashMap<&'static str, Vec<Entry>>,
+    feed_map: HashMap<String, Vec<Entry>>,
 
     // Error, if any, that has occured
     error: Option<String>,
+
+    kc: klunky::KlunkyServer,
 }
 
 // Helper function to call rss::get_articles and set new feed
 impl RssReader {
     // Set the current feed
-    fn set_current_feed(&mut self, url: &'static str) -> Result<(), rss::RssError> {
+    fn set_current_feed(&mut self, url: String) -> Result<(), rss::RssError> {
         // If there's no entry in the hasmap
-        if self.feed_map.get(url).is_none() {
+        if self.feed_map.get(&url).is_none() {
             // Try to get the articles
-            match rss::get_articles(url) {
+            match rss::get_articles(&url) {
                 // If we've gotten them, set them at the url
                 Ok(feed) => {
                     self.feed_map.insert( url, feed.entries );
@@ -57,6 +63,32 @@ impl RssReader {
 
         Ok(())
     }
+
+    fn handle_request(&mut self, req: &klunky::KlunkyRequest) -> klunky::KlunkyResponse {
+        let mut body = String::new();
+
+        match (req.action.as_str(), &req.params) {
+            ("add_url", params) => {
+                self.feed_urls.push( NameUrlPair { name: params.get(0).unwrap().clone(), url: params.get(1).unwrap().clone() })
+            }
+            (x, _) => {body = format!("Unknown command: {}", x)}
+        };
+
+        klunky::KlunkyResponse { result: vec![body.to_owned()], error: vec![] }
+    }
+
+    fn handle_connections(&mut self) {
+        let connections = self.kc.consume_connections().into_iter();
+
+        for mut c in connections {
+            let make_request = c.request();
+            if let Ok(req) = make_request {
+                c.respond(self.handle_request(&req)).unwrap();
+            } else {
+                c.respond(klunky::KlunkyResponse{result:vec![], error: vec![format!("{:?}", make_request)]}).unwrap();
+            }            
+        }
+    }
 }
 
 // Implement default trait for our app
@@ -65,19 +97,21 @@ impl Default for RssReader {
         Self {
             // Some testing urls and names
             feed_urls: vec![
-                NameUrlPair { name: "CNN News",     url: "http://rss.cnn.com/rss/cnn_topstories.rss"},
-                NameUrlPair { name: "Broken host",  url: "http://diwdiuwbdiwubdaiubdowqbdqwb.xyz"   },
-                NameUrlPair { name: "Not a feed",   url: "https://google.com"},
+                NameUrlPair { name: "CNN News".to_string(),     url: "http://rss.cnn.com/rss/cnn_topstories.rss".to_string()},
+                NameUrlPair { name: "Broken host".to_string(),  url: "http://diwdiuwbdiwubdaiubdowqbdqwb.xyz".to_string()   },
+                NameUrlPair { name: "Not a feed".to_string(),   url: "https://google.com".to_string()},
             ],
             
             // No name at the beginning
             current_feed_url: None,
             
             // No feed at the beginning
-            feed_map: HashMap::<&'static str, Vec<Entry>>::new(),
+            feed_map: HashMap::<String, Vec<Entry>>::new(),
 
             // No error messages at the start
             error: None,
+
+            kc: KlunkyServer::new(6666),
         }
     }
 }
@@ -87,6 +121,8 @@ impl eframe::App for RssReader {
 
     // The main update function
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+
+        self.handle_connections();
 
         // Our top panel which just contains the title "RSS".
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
@@ -111,8 +147,8 @@ impl eframe::App for RssReader {
                 // For each of the feed urls, make a button
                 // with the name and set the onclick behavior
                 for feed in &self.feed_urls {
-                    if ui.button(feed.name).clicked() {
-                        self.current_feed_url = Some(feed.url);
+                    if ui.button(feed.name.clone()).clicked() {
+                        self.current_feed_url = Some(feed.url.to_string());
                         name_changed = true;
                     }
                 }
@@ -150,7 +186,7 @@ impl eframe::App for RssReader {
         // So we set the current_feed here.
         if name_changed {
             // From trying to set the feed, we get a response
-            let feed_set_res = self.set_current_feed(self.current_feed_url.unwrap());
+            let feed_set_res = self.set_current_feed(self.current_feed_url.as_ref().unwrap().to_string());
 
             // Match the response
             match feed_set_res {
@@ -180,7 +216,7 @@ impl eframe::App for RssReader {
                     // Show the widget
                     .show(ui, |ui| {
                         // For each feed_rs::Entry in the list, (convert &Option(Vec<Entry>) to Option(&Vec<Entry>) here)
-                        for e in self.feed_map.get(self.current_feed_url.unwrap()).unwrap() {
+                        for e in self.feed_map.get(self.current_feed_url.as_ref().unwrap().as_str()).unwrap() {
                             // Decide what to do if there's a publish date
                             match &e.published {
                                 Some(d) => { ui.label(format!("[{}] ", d));}
